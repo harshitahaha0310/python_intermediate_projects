@@ -1,1 +1,150 @@
+from flask import Flask, request, jsonify
+from transformers import AutoModelForCausalLM, AutoTokenizer
+import torch
+import argparse
+import uuid
+
+# -------- Config --------
+MODEL_NAME = "microsoft/DialoGPT-medium"  # small/medium/large are available
+MAX_HISTORY = 6  # number of past turns to include for context
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+# -------- Initialize model & tokenizer --------
+print(f"Loading model {MODEL_NAME} on {DEVICE} (this may take a while)...")
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+model = AutoModelForCausalLM.from_pretrained(MODEL_NAME).to(DEVICE)
+model.eval()
+print("Model loaded.")
+
+# -------- In-memory session store --------
+# session_histories maps session_id -> list of previous bot+user ids encoded input_ids
+# We'll store the chat history as list of tokenized IDs to feed into model for context.
+session_histories = {}
+
+# -------- Helper functions --------
+def generate_reply(session_id: str, user_message: str, max_length: int = 100) -> str:
+    """
+    Generate a reply using DialoGPT. We keep track of conversation history for a session.
+    """
+    # encode user input
+    new_user_input_ids = tokenizer.encode(user_message + tokenizer.eos_token, return_tensors='pt').to(DEVICE)
+
+    # get existing chat history for session
+    if session_id not in session_histories:
+        session_histories[session_id] = []
+
+    # build the chat history to pass to model
+    # DialoGPT expects concatenated past user and bot inputs; we can append new_user_input to history
+    # For simplicity, store list of tensors and concat when generating.
+    session_histories[session_id].append(new_user_input_ids)
+
+    # keep only last MAX_HISTORY turns to avoid huge context
+    if len(session_histories[session_id]) > MAX_HISTORY:
+        session_histories[session_id] = session_histories[session_id][-MAX_HISTORY:]
+
+    # concatenate history tensors
+    chat_history_ids = torch.cat(session_histories[session_id], dim=-1)
+
+    # generate response
+    with torch.no_grad():
+        bot_output_ids = model.generate(
+            chat_history_ids,
+            max_length=chat_history_ids.shape[-1] + max_length,
+            pad_token_id=tokenizer.eos_token_id,
+            do_sample=True,
+            top_k=50,
+            top_p=0.95,
+            temperature=0.7,
+            num_return_sequences=1,
+            eos_token_id=tokenizer.eos_token_id
+        )
+
+    # The generated sequence contains chat_history + new tokens; extract only new tokens
+    generated_ids = bot_output_ids[:, chat_history_ids.shape[-1]:]
+    bot_reply = tokenizer.decode(generated_ids[0], skip_special_tokens=True).strip()
+
+    # append bot reply to history (so next turn will include it)
+    bot_reply_ids = tokenizer.encode(bot_reply + tokenizer.eos_token, return_tensors='pt').to(DEVICE)
+    session_histories[session_id].append(bot_reply_ids)
+
+    # again trim if necessary
+    if len(session_histories[session_id]) > MAX_HISTORY:
+        session_histories[session_id] = session_histories[session_id][-MAX_HISTORY:]
+
+    return bot_reply
+
+# -------- Flask app --------
+app = Flask(__name__)
+
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({"status": "ok", "device": DEVICE})
+
+@app.route("/chat", methods=["POST"])
+def chat_endpoint():
+    """
+    POST JSON: { "session_id": "<optional>", "message": "Hello" }
+    Response JSON: { "session_id": "...", "reply": "Hi there!" }
+    """
+    data = request.get_json(force=True)
+    if not data or "message" not in data:
+        return jsonify({"error": "Please provide JSON with 'message' field."}), 400
+
+    session_id = data.get("session_id", None) or str(uuid.uuid4())
+    user_message = data["message"]
+
+    try:
+        reply = generate_reply(session_id, user_message)
+        return jsonify({"session_id": session_id, "reply": reply})
+    except Exception as e:
+        return jsonify({"error": "generation_failed", "details": str(e)}), 500
+
+@app.route("/reset", methods=["POST"])
+def reset_session():
+    """
+    Reset server-side memory for a session:
+    POST JSON: { "session_id": "..." }
+    """
+    data = request.get_json(force=True)
+    session_id = data.get("session_id")
+    if not session_id:
+        return jsonify({"error": "Please provide session_id"}), 400
+    session_histories.pop(session_id, None)
+    return jsonify({"status": "reset", "session_id": session_id})
+
+# -------- CLI mode --------
+def run_cli():
+    print("Starting CLI chat mode (type 'exit' to quit, 'reset' to reset conversation).")
+    sid = str(uuid.uuid4())
+    while True:
+        usr = input("You: ").strip()
+        if not usr:
+            continue
+        if usr.lower() in ["exit", "quit"]:
+            print("Bye!")
+            break
+        if usr.lower() == "reset":
+            session_histories.pop(sid, None)
+            sid = str(uuid.uuid4())
+            print("Session reset. New session id:", sid)
+            continue
+        try:
+            reply = generate_reply(sid, usr)
+            print("Bot:", reply)
+        except Exception as e:
+            print("Error generating reply:", e)
+
+# -------- Main --------
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--host", default="0.0.0.0", help="Flask host")
+    parser.add_argument("--port", type=int, default=5000, help="Flask port")
+    parser.add_argument("--cli", action="store_true", help="Run interactive CLI instead of Flask server")
+    args = parser.parse_args()
+
+    if args.cli:
+        run_cli()
+    else:
+        print(f"Starting Flask server on http://{args.host}:{args.port}")
+        app.run(host=args.host, port=args.port)
 
